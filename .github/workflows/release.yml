@@ -37,10 +37,7 @@ jobs:
           go-version-file: src/go.mod
 
       - name: build b4sni
-        run: |
-          chmod +x ./src/embed.sh
-          ./src/embed.sh
-          make all
+        run: make all
 
       - name: list built files
         run: ls -al out out/assets
