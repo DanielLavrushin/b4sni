@@ -1,7 +1,18 @@
 package sni
 
 import (
+	"encoding/binary"
+	"fmt"
+	"net"
+	"syscall"
+	"time"
+
 	"github.com/daniellavrushin/b4sni/log"
+)
+
+const (
+	ETH_P_ALL = 0x0003
+	ETH_HLEN  = 14
 )
 
 const (
@@ -14,6 +25,370 @@ const (
 )
 
 type parseErr string
+
+func (e *SNIExtractor) Init() error {
+	// Create AF_PACKET raw socket
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(ETH_P_ALL)))
+	if err != nil {
+		return fmt.Errorf("failed to create raw socket (need root privileges): %v", err)
+	}
+
+	e.fd = fd
+
+	// Set receive buffer size for better performance
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 8*1024*1024); err != nil {
+		log.Infof("Warning: failed to set receive buffer size: %v", err)
+	}
+
+	return nil
+}
+
+func (e *SNIExtractor) Close() {
+	if e.fd != 0 {
+		syscall.Close(e.fd)
+	}
+}
+
+func (e *SNIExtractor) Run() {
+	buf := make([]byte, 65536)
+
+	for {
+		n, _, err := syscall.Recvfrom(e.fd, buf, 0)
+		if err != nil {
+			if err != syscall.EAGAIN && err != syscall.EINTR {
+				log.Infof("Error receiving packet: %v", err)
+			}
+			continue
+		}
+
+		e.processPacket(buf[:n])
+	}
+}
+
+func NewTCPStreamTracker() *TCPStreamTracker {
+	tracker := &TCPStreamTracker{
+		streams: make(map[TCPStreamKey]*TCPStream),
+	}
+
+	// Clean up old streams periodically
+	go tracker.Cleanup()
+
+	return tracker
+}
+
+func (t *TCPStreamTracker) Cleanup() {
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		t.mu.Lock()
+		now := time.Now()
+		for key, stream := range t.streams {
+			if now.Sub(stream.lastSeen) > 60*time.Second {
+				delete(t.streams, key)
+			}
+		}
+		t.mu.Unlock()
+	}
+}
+
+func (t *TCPStreamTracker) ProcessPacket(packet []byte, srcIP, dstIP string) (string, FlowKey) {
+	if len(packet) < 20 {
+		return "", FlowKey{}
+	}
+
+	srcPort := binary.BigEndian.Uint16(packet[0:2])
+	dstPort := binary.BigEndian.Uint16(packet[2:4])
+	dataOffset := (packet[12] >> 4) * 4
+	flags := packet[13]
+
+	flowKey := FlowKey{
+		SrcIP:   srcIP,
+		DstIP:   dstIP,
+		SrcPort: srcPort,
+		DstPort: dstPort,
+	}
+
+	// Skip packets without payload
+	if int(dataOffset) >= len(packet) {
+		return "", flowKey
+	}
+
+	payload := packet[dataOffset:]
+	if len(payload) == 0 {
+		return "", flowKey
+	}
+
+	// Create stream key (normalize direction)
+	streamKey := TCPStreamKey{
+		SrcIP:   srcIP,
+		DstIP:   dstIP,
+		SrcPort: srcPort,
+		DstPort: dstPort,
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	stream, exists := t.streams[streamKey]
+	if !exists {
+		// Also check reverse direction
+		reverseKey := TCPStreamKey{
+			SrcIP:   dstIP,
+			DstIP:   srcIP,
+			SrcPort: dstPort,
+			DstPort: srcPort,
+		}
+		if stream, exists = t.streams[reverseKey]; exists {
+			streamKey = reverseKey
+		}
+	}
+
+	// RST or FIN - clean up stream
+	if flags&0x05 != 0 {
+		if exists {
+			delete(t.streams, streamKey)
+		}
+		return "", flowKey
+	}
+
+	// Create new stream if needed
+	if !exists {
+		stream = &TCPStream{
+			buffer:   make([]byte, 0, 4096),
+			lastSeen: time.Now(),
+		}
+		t.streams[streamKey] = stream
+	}
+
+	stream.lastSeen = time.Now()
+
+	// If we already found SNI for this stream, skip
+	if stream.sniFound {
+		return "", flowKey
+	}
+
+	// Append payload to buffer
+	stream.buffer = append(stream.buffer, payload...)
+
+	// Try to extract SNI from accumulated buffer
+	sni := t.tryExtractSNI(stream)
+	if sni != "" {
+		stream.sniFound = true
+		// Clean up large buffer after SNI found
+		if len(stream.buffer) > 1024 {
+			stream.buffer = stream.buffer[:1024]
+		}
+		return sni, flowKey
+	}
+
+	// Limit buffer size to prevent memory issues
+	if len(stream.buffer) > 16384 {
+		stream.buffer = stream.buffer[8192:]
+	}
+
+	return "", flowKey
+}
+
+func (e *SNIExtractor) processTCP(packet []byte, srcIP, dstIP string) (string, FlowKey, string) {
+	// Use the stream tracker instead of direct parsing
+	sni, flowKey := e.TcpTracker.ProcessPacket(packet, srcIP, dstIP)
+
+	if sni != "" {
+		return sni, flowKey, "TCP"
+	}
+
+	return "", flowKey, ""
+}
+
+func (e *SNIExtractor) processUDP(packet []byte, srcIP, dstIP string) (string, FlowKey, string) {
+	if len(packet) < 8 {
+		return "", FlowKey{}, ""
+	}
+
+	srcPort := binary.BigEndian.Uint16(packet[0:2])
+	dstPort := binary.BigEndian.Uint16(packet[2:4])
+
+	flowKey := FlowKey{
+		SrcIP:   srcIP,
+		DstIP:   dstIP,
+		SrcPort: srcPort,
+		DstPort: dstPort,
+	}
+
+	// Filter for common QUIC ports in userspace
+	if srcPort != 443 && dstPort != 443 &&
+		srcPort != 8443 && dstPort != 8443 &&
+		srcPort != 853 && dstPort != 853 {
+		return "", flowKey, ""
+	}
+
+	payload := packet[8:]
+
+	// Check for QUIC
+	if len(payload) > 0 && (payload[0]&0x80) != 0 {
+		sni, _ := ParseQUICClientHelloSNI(payload)
+		return sni, flowKey, "UDP"
+	}
+
+	return "", flowKey, ""
+}
+
+func (t *TCPStreamTracker) tryExtractSNI(stream *TCPStream) string {
+	buf := stream.buffer
+
+	// Look for TLS handshake in the buffer
+	for i := 0; i < len(buf)-5; i++ {
+		// Check for TLS handshake record
+		if buf[i] != 0x16 {
+			continue
+		}
+
+		// Check TLS version (0x0301 to 0x0304)
+		if buf[i+1] != 0x03 || buf[i+2] > 0x04 {
+			continue
+		}
+
+		// Get record length
+		recordLen := int(buf[i+3])<<8 | int(buf[i+4])
+		if i+5+recordLen > len(buf) {
+			// Need more data
+			break
+		}
+
+		// Try to parse SNI from this position
+		if sni, ok := ParseTLSClientHelloSNI(buf[i:]); ok && sni != "" {
+			return sni
+		}
+	}
+
+	return ""
+}
+
+func (e *SNIExtractor) processIPv4(packet []byte) (string, FlowKey, string) {
+	if len(packet) < 20 {
+		return "", FlowKey{}, ""
+	}
+
+	versionIHL := packet[0]
+	ipHeaderLen := int((versionIHL & 0x0F) * 4)
+	if ipHeaderLen < 20 || len(packet) < ipHeaderLen {
+		return "", FlowKey{}, ""
+	}
+
+	protocol := packet[9]
+	srcIP := net.IP(packet[12:16]).String()
+	dstIP := net.IP(packet[16:20]).String()
+
+	// Check for fragmentation
+	flagsFrags := binary.BigEndian.Uint16(packet[6:8])
+	if (flagsFrags & 0x1FFF) != 0 { // Fragment offset != 0
+		return "", FlowKey{}, ""
+	}
+
+	transportPacket := packet[ipHeaderLen:]
+
+	switch protocol {
+	case 6: // TCP
+		return e.processTCP(transportPacket, srcIP, dstIP)
+	case 17: // UDP
+		return e.processUDP(transportPacket, srcIP, dstIP)
+	}
+
+	return "", FlowKey{}, ""
+}
+
+func (e *SNIExtractor) processIPv6(packet []byte) (string, FlowKey, string) {
+	if len(packet) < 40 {
+		return "", FlowKey{}, ""
+	}
+
+	nextHeader := packet[6]
+	srcIP := net.IP(packet[8:24]).String()
+	dstIP := net.IP(packet[24:40]).String()
+
+	// Skip extension headers if present
+	offset := 40
+	for isExtensionHeader(nextHeader) && offset < len(packet) {
+		if offset+2 > len(packet) {
+			return "", FlowKey{}, ""
+		}
+		extLen := int(packet[offset+1])*8 + 8
+		nextHeader = packet[offset]
+		offset += extLen
+	}
+
+	transportPacket := packet[offset:]
+
+	switch nextHeader {
+	case 6: // TCP
+		return e.processTCP(transportPacket, srcIP, dstIP)
+	case 17: // UDP
+		return e.processUDP(transportPacket, srcIP, dstIP)
+	}
+
+	return "", FlowKey{}, ""
+}
+
+func isExtensionHeader(nextHeader uint8) bool {
+	switch nextHeader {
+	case 0, 43, 44, 60: // Hop-by-hop, Routing, Fragment, Destination options
+		return true
+	}
+	return false
+}
+
+func (e *SNIExtractor) processPacket(packet []byte) {
+	if len(packet) < ETH_HLEN {
+		return
+	}
+
+	ethType := binary.BigEndian.Uint16(packet[12:14])
+	payload := packet[ETH_HLEN:]
+
+	var sni string
+	var flowKey FlowKey
+	var proto string
+
+	switch ethType {
+	case 0x0800: // IPv4
+		sni, flowKey, proto = e.processIPv4(payload)
+	case 0x86DD: // IPv6
+		sni, flowKey, proto = e.processIPv6(payload)
+	default:
+		return
+	}
+
+	if sni != "" {
+		e.printSNI(flowKey, sni, proto)
+	}
+}
+
+func (e *SNIExtractor) printSNI(flowKey FlowKey, sni string, proto string) {
+	timestamp := time.Now().Format("15:04:05.000")
+
+	const (
+		colorReset  = "\033[0m"
+		colorGreen  = "\033[32m"
+		colorYellow = "\033[33m"
+		colorCyan   = "\033[36m"
+	)
+
+	protoColor := colorCyan
+	if proto == "TCP" {
+		protoColor = colorGreen
+	}
+
+	fmt.Printf("%s,%s%s%s,%s:%d,%s:%d,%s%s%s\n",
+		timestamp,
+		protoColor, proto, colorReset,
+		flowKey.SrcIP, flowKey.SrcPort,
+		flowKey.DstIP, flowKey.DstPort,
+		colorYellow, sni, colorReset,
+	)
+}
+
+func htons(i uint16) uint16 {
+	return (i<<8)&0xff00 | i>>8
+}
 
 func (e parseErr) Error() string { return string(e) }
 
