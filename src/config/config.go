@@ -27,6 +27,10 @@ func (c *Config) BindFlags(cmd *cobra.Command) {
 	// Network configuration
 	cmd.Flags().StringVar(&c.Interface, "interface", c.Interface, "Network interface to bind to (e.g., eth0, all)")
 
+	// Logging configuration
+	cmd.Flags().BoolVar(&c.Logging.Instaflush, "log-instafflush", c.Logging.Instaflush, "Enable instant flushing of log messages")
+	cmd.Flags().BoolVar(&c.Logging.Syslog, "log-syslog", c.Logging.Syslog, "Enable logging to syslog")
+
 }
 
 func (cfg *Config) ApplyLogLevel(level string) {

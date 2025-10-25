@@ -365,24 +365,13 @@ func (e *SNIExtractor) processPacket(packet []byte) {
 func (e *SNIExtractor) printSNI(flowKey FlowKey, sni string, proto string) {
 	timestamp := time.Now().Format("15:04:05.000")
 
-	const (
-		colorReset  = "\033[0m"
-		colorGreen  = "\033[32m"
-		colorYellow = "\033[33m"
-		colorCyan   = "\033[36m"
-	)
-
-	protoColor := colorCyan
-	if proto == "TCP" {
-		protoColor = colorGreen
-	}
-
-	fmt.Printf("%s,%s%s%s,%s:%d,%s:%d,%s%s%s\n",
+	// Print in CSV format: timestamp, protocol, srcIP:srcPort, dstIP:dstPort, SNI
+	fmt.Printf("%s,%s,%s:%d,%s:%d,%s\n",
 		timestamp,
-		protoColor, proto, colorReset,
+		proto,
 		flowKey.SrcIP, flowKey.SrcPort,
 		flowKey.DstIP, flowKey.DstPort,
-		colorYellow, sni, colorReset,
+		sni,
 	)
 }
 

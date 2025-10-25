@@ -1,4 +1,6 @@
 VERSION ?= 1.0.0
+VERSION_COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null)
+VERSION_DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BINARY_NAME := b4sni
 SRC_DIR := ./src
 OUT_DIR := ./out
@@ -105,7 +107,7 @@ build_single:
 	OUT_PATH="$(OUT_DIR)/$(GOOS)-$(TARGET)"; \
 	echo "Building for $(GOOS) ($(TARGET))..."; \
 	mkdir -p "$$OUT_PATH" "$(OUT_DIR)/assets"; \
-	GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=$(CGO_ENABLED) go -C $(SRC_DIR) build -ldflags "-X main.Version=$(VERSION)" -o ../"$$OUT_PATH"/$(BINARY_NAME); \
+	GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=$(CGO_ENABLED) go -C $(SRC_DIR) build -ldflags "-X main.Version=$(VERSION) -X main.Commit=$(VERSION_COMMIT) -X main.Date=$(VERSION_DATE)" -o ../"$$OUT_PATH"/$(BINARY_NAME); \
 	tar -C "$$OUT_PATH" -czf "$(OUT_DIR)/assets/$(BINARY_NAME)-$(GOOS)-$(TARGET).tar.gz" "$(BINARY_NAME)"; \
 	sha256sum "$(OUT_DIR)/assets/$(BINARY_NAME)-$(GOOS)-$(TARGET).tar.gz" > "$(OUT_DIR)/assets/$(BINARY_NAME)-$(GOOS)-$(TARGET).tar.gz.sha256"
 
@@ -119,7 +121,7 @@ build_single_android:
 	OUT_PATH="$(OUT_DIR)/$(GOOS)-$(TARGET)"; \
 	echo "Building for $(GOOS) ($(TARGET))..."; \
 	mkdir -p "$$OUT_PATH" "$(OUT_DIR)/assets"; \
-	GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=1 CC=$$CC go -C $(SRC_DIR) build -ldflags "-X main.Version=$(VERSION)" -o ../"$$OUT_PATH"/$(BINARY_NAME); \
+	GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=1 CC=$$CC go -C $(SRC_DIR) build -ldflags "-X main.Version=$(VERSION) -X main.Commit=$(VERSION_COMMIT) -X main.Date=$(VERSION_DATE)" -o ../"$$OUT_PATH"/$(BINARY_NAME); \
 	tar -C "$$OUT_PATH" -czf "$(OUT_DIR)/assets/$(BINARY_NAME)-$(GOOS)-$(TARGET).tar.gz" "$(BINARY_NAME)"; \
 	sha256sum "$(OUT_DIR)/assets/$(BINARY_NAME)-$(GOOS)-$(TARGET).tar.gz" > "$(OUT_DIR)/assets/$(BINARY_NAME)-$(GOOS)-$(TARGET).tar.gz.sha256"
 
