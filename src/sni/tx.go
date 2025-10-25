@@ -51,7 +51,6 @@ func (i *Injector) Close() {
 }
 
 // SendRaw takes a full L3 packet (IPv4 or IPv6, with transport header + data)
-// and pushes it out via raw socket, like youtubeUnblock.
 func (i *Injector) SendRaw(pkt []byte) error {
 	if len(pkt) < 1 {
 		return nil
