@@ -36,7 +36,7 @@ jobs:
         with:
           go-version-file: src/go.mod
 
-      - name: build b4
+      - name: build b4sni
         run: |
           chmod +x ./src/embed.sh
           ./src/embed.sh
@@ -59,7 +59,7 @@ jobs:
       - name: upload files to artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: b4-${{ env.VERSION }}
+          name: b4sni-${{ env.VERSION }}
           path: ${{ steps.assets.outputs.files }}
 
       - name: create or update release
